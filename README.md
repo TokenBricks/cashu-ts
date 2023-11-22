@@ -57,7 +57,7 @@ npm i @cashu/cashu-ts
 ```typescript
 import { CashuMint, CashuWallet, getEncodedToken } from '@cashu/cashu-ts';
 
-const wallet = new CashuWallet(new CashuMint('{MINT_URL}'));
+const wallet = new CashuWallet(new CashuMint('{MINT_URL}'), '{MNEMONIC}');
 
 const { pr, hash } = await wallet.requestMint(200);
 
@@ -72,6 +72,25 @@ async function invoiceHasBeenPaid() {
 	});
 	console.log(encoded);
 }
+```
+
+### Generate a mnemonic
+
+```typescript
+import { CashuWallet } from '@cashu/cashu-ts';
+const mnemonic = CashuWallet.generateMnemonic();
+// store the mnemonic in your local storage
+```
+
+### Restore a wallet history
+
+```typescript
+
+import { CashuWallet } from '@cashu/cashu-ts';  
+const wallet = new CashuWallet(new CashuMint('{MINT_URL}'), '{MNEMONIC}');
+const { spendableProofs } = await wallet.restore();
+// store the spendableProofs in your local storage
+
 ```
 
 ## Contribute

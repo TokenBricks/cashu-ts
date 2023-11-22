@@ -47,6 +47,9 @@
 	"dependencies": {
 		"@gandlaf21/bolt11-decode": "^3.0.6",
 		"@noble/curves": "^1.0.0",
-		"buffer": "^6.0.3"
+		"buffer": "^6.0.3",
+		"bip32": "4.0.0",
+		"bip39": "3.0.1",
+		"tiny-secp256k1": "2.2.3"
 	}
 }

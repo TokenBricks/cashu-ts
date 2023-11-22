@@ -5,7 +5,7 @@ import { BlindedMessage } from './model/BlindedMessage.js';
 import {
 	AmountPreference,
 	BlindedMessageData,
-	BlindedTransaction,
+	BlindedTransaction, MeltResponse,
 	MintKeys,
 	PayLnInvoiceResponse,
 	PaymentPayload,
@@ -19,12 +19,21 @@ import {
 	TokenEntry
 } from './model/types/index.js';
 import {
+	bytesToNumber,
 	cleanToken,
 	deriveKeysetId,
 	getDecodedToken,
-	getDefaultAmountPreference,
+	getDefaultAmountPreference, joinUrls,
 	splitAmount
 } from './utils.js';
+import * as bip39 from "bip39";
+import BIP32Factory from 'bip32';
+import * as ecc from 'tiny-secp256k1';
+import { secp256k1 } from '@noble/curves/secp256k1';
+import { BIP32Interface } from 'bip32';
+import crypto from "crypto";
+import request from "./request";
+const bip32 = BIP32Factory(ecc);
 
 /**
  * Class that represents a Cashu wallet.
@@ -34,14 +43,24 @@ class CashuWallet {
 	private _keys: MintKeys;
 	private _keysetId = '';
 	mint: CashuMint;
+	private seed: Buffer | undefined;
+	private mnemonic: string | undefined;
+	private privateKey: BIP32Interface | undefined;
+	private node: BIP32Interface | undefined;
+	private proofs: any[] = [];
 
 	/**
 	 * @param keys public keys from the mint
+	 * @param mnemonic mnemonic to derive the private key from
 	 * @param mint Cashu mint instance is used to make api calls
 	 */
-	constructor(mint: CashuMint, keys?: MintKeys) {
+	constructor(mint: CashuMint, mnemonic: string, keys?: MintKeys) {
 		this._keys = keys || {};
 		this.mint = mint;
+		this.seed = bip39.mnemonicToSeedSync(mnemonic);
+		this.mnemonic = mnemonic;
+		this.node = bip32.fromSeed(this.seed);
+		this.privateKey = this.node.derivePath("m/129372'/0'/0'/0'");
 		if (keys) {
 			this._keysetId = deriveKeysetId(this._keys);
 		}
@@ -453,6 +472,295 @@ class CashuWallet {
 
 		return { blindedMessages, secrets, rs };
 	}
+	private async  restorePromises(outputs: any[], secrets: string[], rs: Uint8Array[], derivationPaths: string[]) {
+		// Call the super().restore_promises method and await the result
+		const [restoredOutputs, restoredPromises] = await this.requestRestorePromises(outputs);
+		// console.log('restoredOutputs', restoredOutputs)
+		// console.log('restoredPromises', restoredPromises)
+		// Find matching indices between restoredOutputs and outputs
+		const matchingIndices = outputs.reduce((indices, output, idx) => {
+			if (restoredOutputs.some((restoredOutput: any) => restoredOutput.B_ === output.B_)) {
+				indices.push(idx);
+			}
+			return indices;
+		}, []);
+
+		// Filter secrets and rs based on matching indices
+		const filteredSecrets: Uint8Array[] = matchingIndices.map((idx: any) => {
+			const enc = new TextEncoder();
+			const secretUInt8 = enc.encode(secrets[idx]);
+			return secretUInt8;
+		});
+		const filteredRs: bigint[] = matchingIndices.map((idx: any) => bytesToNumber(rs[idx]));
+		// console.log('restoredPromises',restoredPromises)
+		// Call the _construct_proofs method with the restored promises, filtered secrets, rs, and derivation paths
+		const proofs = dhke.constructProofs(restoredPromises, filteredRs, filteredSecrets, this._keys!);
+
+		console.log(`Restored ${restoredPromises.length} promises`);
+
+		// Call the _store_proofs method with the generated proofs
+		// await this._store_proofs(proofs);
+
+		// Append the proofs to the proofs in memory
+		proofs.forEach(proof => {
+			if (!this.proofs.some(existingProof => existingProof.secret === proof.secret)) {
+				this.proofs.push(proof);
+			}
+		});
+
+		return proofs;
+	}
+	private async generateDeterministicSecret(counter: number): Promise<[Uint8Array, Uint8Array, string]> {
+		if (!this.node) {
+			throw new Error("node not initialized");
+		}
+		if (!this.mnemonic) {
+			throw new Error("cashWallet not initialized");
+		}
+		const keysetIdBytes = Buffer.from(this._keysetId, 'base64');
+		const keysetIdBigInt = BigInt('0x' + keysetIdBytes.toString('hex'));
+		const maxChildKeys = BigInt(2 ** 31 - 1);
+		const keyestId = Number(keysetIdBigInt % maxChildKeys);
+
+		const tokenDerivationPath = `m/129372'/0'/${keyestId}'/${counter}'`;
+		const secretDerivationPath = `${tokenDerivationPath}/0`;
+
+		// console.log(`secret derivation path: ${secretDerivationPath}`);
+		const { privateKey: secret }= this.node.derivePath(secretDerivationPath);
+		const rDerivationPath = `${tokenDerivationPath}/1`;
+		const { privateKey: r }= this.node.derivePath(rDerivationPath);
+
+		return [
+			new Uint8Array(secret!),
+			new Uint8Array(r!),
+			tokenDerivationPath
+		]
+	}
+	private async generateSecretsFromTo(fromCounter: number, toCounter: number): Promise<[string[], Uint8Array[], string[]]> {
+		if (fromCounter > toCounter) {
+			throw new Error("fromCounter must be smaller than toCounter");
+		}
+
+		const secretCounters = [];
+		for (let c = fromCounter; c <= toCounter; c++) {
+			secretCounters.push(c);
+		}
+
+		const secretsRsDerivationPaths = [];
+		for (const secretCounter of secretCounters) {
+			const secretRsDerivationPath = await this.generateDeterministicSecret(secretCounter);
+			secretsRsDerivationPaths.push(secretRsDerivationPath);
+		}
+
+		const secrets = secretsRsDerivationPaths.map((s) => {
+			const secretHash = crypto.createHash('sha256');
+			secretHash.update(s[0]);
+			return secretHash.digest('hex');
+		})
+		// console.log('secrets', secrets)
+		//     .map(s => {
+		//     const encoder = new TextEncoder();
+		//     const uint8Array = encoder.encode(s);
+		//     return uint8Array;
+		// });
+		const rs: Uint8Array[] = secretsRsDerivationPaths.map((s) => {
+			return s[1]
+		});
+
+		const derivationPaths = secretsRsDerivationPaths.map((s) => s[2]);
+
+		return [secrets, rs, derivationPaths];
+	}
+	private async restorePromisesFromTo(fromCounter: number, toCounter: number) {
+		const [secrets, rs, derivationPaths] = await this.generateSecretsFromTo(fromCounter, toCounter);
+		// console.log('secrets', secrets)
+		// console.log('rs', rs)
+		// console.log('derivationPaths', derivationPaths)
+		// Create a dummy amounts array with the same length as secrets
+		const amountsDummy = Array(secrets.length).fill(1);
+		// console.log('amountsDummy', amountsDummy)
+		const [regeneratedOutputs, _] = this.constructOutputs(amountsDummy, secrets, rs);
+		// console.log('regeneratedOutputs', regeneratedOutputs)
+		// // Ask the mint to reissue the promises
+		const proofs = await this.restorePromises(
+			regeneratedOutputs,
+			secrets,
+			rs,
+			derivationPaths,
+		);
+		// console.log('proofs', proofs)
+
+		return proofs;
+	}
+	private async requestRestorePromises(outputs: any[]) {
+		try {
+			// Create the payload
+			const payload = {
+				outputs: outputs
+			};
+
+			// Make the POST request to the API
+			const response = await request<any>({
+				endpoint: joinUrls(this.mint.mintUrl, '/restore'),
+				method: 'POST',
+				requestBody: payload
+			})
+
+
+			// Check for errors in the response (handle this according to your needs)
+			if (response.code !== 200) {
+				throw new Error(`Failed to restore promises. Status code: ${response.code}`);
+			}
+
+			// Parse the response JSON
+			const responseObj = response;
+			// console.log('responseObj', responseObj)
+			// Assuming you have appropriate data structures to parse the response
+			const returnObj = {
+				outputs: responseObj.outputs,
+				promises: responseObj.promises
+			};
+
+			return [returnObj.outputs, returnObj.promises];
+		} catch (error) {
+			// Handle any errors (e.g., network errors, API errors)
+			throw new Error(`Error restoring promises: ${error}`);
+		}
+	}
+	private constructOutputs(amounts: number[], secrets: string[], rs: Uint8Array[] = []) {
+		// Check if the lengths of amounts and secrets are equal
+		if (amounts.length !== secrets.length) {
+			throw new Error(`Length of amounts (${amounts.length}) is not equal to length of secrets (${secrets.length})`);
+		}
+
+		const outputs = [];
+		const rsReturn = [];
+
+		// If rs is not provided, initialize it with null values
+		const rs_ = rs.length === 0 ? new Array(amounts.length).fill(null) : rs;
+
+		for (let i = 0; i < secrets.length; i++) {
+			const secret = secrets[i];
+			const amount = amounts[i];
+			let r = rs_[i];
+
+			// Call the b_dhke.step1_alice function here and assign B_ and r values
+			// You'll need to replace this with your actual implementation
+			const { B_, r: newR } = this.step1Alice(secret, r);
+
+			rsReturn.push(newR);
+
+			// Create a BlindedMessage object with the required properties
+			const output = {
+				amount: amount,
+				B_: B_.toHex() // Make sure to serialize B_ correctly
+			};
+
+			outputs.push(output);
+
+			// console.log(`Constructing output: ${JSON.stringify(output)}, r: ${newR}`);
+		}
+
+		return [outputs, rsReturn];
+	}
+	private step1Alice(secret: string, r: Uint8Array) {
+		const enc = new TextEncoder();
+		const secretUInt8 = enc.encode(secret);
+
+		const Y = dhke.hashToCurve(secretUInt8);
+		if (!r) {
+			r = secp256k1.utils.randomPrivateKey();
+		}
+		// const rG = secp256k1.ProjectivePoint.BASE.multiply(r);
+
+
+		const B_ = Y.add(secp256k1.ProjectivePoint.fromPrivateKey(r));
+		return { B_, r };
+
+	}
+	private async invalidate(proofs: any[], checkSpendable = true) {
+		const invalidatedProofs: any[] = [];
+
+		if (checkSpendable) {
+
+			const proofStates = await this.mint!.check({proofs});
+
+			for (let i = 0; i < proofStates.spendable.length; i++) {
+				if (!proofStates.spendable[i]) {
+					invalidatedProofs.push(proofs[i]);
+				}
+			}
+		} else {
+			invalidatedProofs.push(...proofs);
+		}
+
+		if (invalidatedProofs.length > 0) {
+			console.log(`Invalidating ${invalidatedProofs.length} proofs worth ${this.sumProofs(invalidatedProofs)} sat.`);
+		}
+
+		// Assuming you have a database connection and an invalidateProof function
+		// const conn = await this.db.connect();
+		// for (const p of invalidatedProofs) {
+		//     await invalidateProof(p, this.db, conn);
+		// }
+
+		const invalidateSecrets = invalidatedProofs.map(p => p.secret);
+		this.proofs = this.proofs.filter(p => !invalidateSecrets.includes(p.secret));
+
+		// Filter out invalidated proofs from the original proofs list
+		const remainingProofs = proofs.filter(p => !invalidatedProofs.includes(p));
+
+		return remainingProofs;
+	}
+	sumProofs(proofs: any[]) {
+		return proofs.reduce((sum, p) => sum + p.amount, 0);
+	}
+	static generateMnemonic(): string {
+		return bip39.generateMnemonic();
+	}
+	async restore() {
+		console.log("Restoring tokens...");
+		let stopCounter = 0;
+		const to = 2;
+		const batch = 25;
+		let spendableProofs = [];
+		const counterBefore = 0
+
+		let i = counterBefore;
+		let nLastRestoredProofs = 0;
+
+		while (stopCounter < to) {
+			console.log(`Restoring token ${i} to ${i + batch - 1}...`);
+			const restoredProofs = await this.restorePromisesFromTo(i, i + batch - 1);
+			// console.log('restoredProofs length', restoredProofs.length)
+			if (restoredProofs.length === 0) {
+				stopCounter++;
+			}
+
+			spendableProofs = await this.invalidate(restoredProofs);
+			// console.log('spendableProofs', spendableProofs)
+			if (spendableProofs.length) {
+				nLastRestoredProofs = spendableProofs.length;
+				console.log(`Restored ${this.sumProofs(restoredProofs)} sat`);
+			}
+
+			i += batch;
+		}
+		//
+		// Restore the secret counter to its previous value for the last round
+		const revertCounterBy = batch * to + nLastRestoredProofs;
+		console.log(`Reverting secret counter by ${revertCounterBy}`);
+
+		if (nLastRestoredProofs === 0) {
+			console.log("No tokens restored.");
+			return;
+		}
+		return {
+			spendableProofs,
+		}
+
+	}
+
 }
 
 export { CashuWallet };
